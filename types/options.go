@@ -15,6 +15,7 @@ import (
 	"github.com/containers/storage/pkg/homedir"
 	"github.com/containers/storage/pkg/idtools"
 	"github.com/containers/storage/pkg/unshare"
+	"github.com/imdario/mergo"
 	"github.com/sirupsen/logrus"
 )
 
@@ -49,6 +50,12 @@ var (
 	defaultConfigFile = SystemConfigFile
 	// DefaultStoreOptions is a reasonable default set of options.
 	defaultStoreOptions StoreOptions
+
+	// defaultOverrideConfigFile path to override the default system wide storage.conf file
+	defaultOverrideConfigFile = "/etc/containers/storage.conf"
+
+	// defaultDropInConfigDir path to the folder containing drop in config files
+	defaultDropInConfigDir = defaultOverrideConfigFile + ".d"
 )
 
 func loadDefaultStoreOptions() {
@@ -114,11 +121,66 @@ func loadDefaultStoreOptions() {
 
 // loadStoreOptions returns the default storage ops for containers
 func loadStoreOptions() (StoreOptions, error) {
-	storageConf, err := DefaultConfigFile()
+	baseConf, err := DefaultConfigFile()
 	if err != nil {
 		return defaultStoreOptions, err
 	}
-	return loadStoreOptionsFromConfFile(storageConf)
+
+	// Load the base config file
+	baseOptions, err := loadStoreOptionsFromConfFile(baseConf)
+	if err != nil {
+		return defaultStoreOptions, err
+	}
+
+	if _, err := os.Stat(defaultDropInConfigDir); err == nil {
+		// The directory exists, so merge the configuration from this directory
+		err = mergeConfigFromDirectory(&baseOptions, defaultDropInConfigDir)
+		if err != nil {
+			return defaultStoreOptions, err
+		}
+	} else if !os.IsNotExist(err) {
+		// There was an error other than the directory not existing
+		return defaultStoreOptions, err
+	}
+
+	return baseOptions, nil
+}
+
+func mergeConfigFromDirectory(baseOptions *StoreOptions, configDir string) error {
+	return filepath.Walk(configDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+
+		// Only consider files with .conf extension
+		if filepath.Ext(path) != ".conf" {
+			return nil
+		}
+
+		// Read TOML config file
+		tomlConfig, err := ReadTomlConfigFile(path)
+		if err != nil {
+			return err
+		}
+
+		// Convert TOML to StorageOptions
+		storageOptions, err := ConvertTomlToStoreOptions(tomlConfig)
+		if err != nil {
+			return err
+		}
+
+		mergo.Merge(baseOptions, storageOptions, mergo.WithOverride)
+		// // Load drop-in options from the current file
+		// err = ReloadConfigurationFile(path, baseOptions, false)
+		// if err != nil {
+		// 	return err
+		// }
+
+		return nil
+	})
 }
 
 // usePerUserStorage returns whether the user private storage must be used.
@@ -399,7 +461,7 @@ func ReloadConfigurationFileIfNeeded(configFile string, storeOptions *StoreOptio
 		return nil
 	}
 
-	if err := ReloadConfigurationFile(configFile, storeOptions); err != nil {
+	if err := ReloadConfigurationFile(configFile, storeOptions, true); err != nil {
 		return err
 	}
 
@@ -410,9 +472,28 @@ func ReloadConfigurationFileIfNeeded(configFile string, storeOptions *StoreOptio
 	return nil
 }
 
+func ReadTomlConfigFile(configFile string) (config *TomlConfig, err error) {
+	config = new(TomlConfig)
+
+	meta, err := toml.DecodeFile(configFile, &config)
+	if err == nil {
+		keys := meta.Undecoded()
+		if len(keys) > 0 {
+			logrus.Warningf("Failed to decode the keys %q from %q", keys, configFile)
+		}
+	} else {
+		if !os.IsNotExist(err) {
+			logrus.Warningf("Failed to read %s %v\n", configFile, err.Error())
+			return nil, err
+		}
+	}
+
+	return config, nil
+}
+
 // ReloadConfigurationFile parses the specified configuration file and overrides
 // the configuration in storeOptions.
-func ReloadConfigurationFile(configFile string, storeOptions *StoreOptions) error {
+func ReloadConfigurationFile(configFile string, storeOptions *StoreOptions, initializeOptions bool) error {
 	config := new(TomlConfig)
 
 	meta, err := toml.DecodeFile(configFile, &config)
@@ -428,8 +509,16 @@ func ReloadConfigurationFile(configFile string, storeOptions *StoreOptions) erro
 		}
 	}
 
-	// Clear storeOptions of previous settings
-	*storeOptions = StoreOptions{}
+	// keySet := make(map[string]bool)
+	// for _, key := range meta.Keys() {
+	// 	keySet[key.String()] = true
+	// }
+
+	if initializeOptions {
+		// Clear storeOptions of previous settings
+		*storeOptions = StoreOptions{}
+	}
+
 	if config.Storage.Driver != "" {
 		storeOptions.GraphDriverName = config.Storage.Driver
 	}
@@ -519,8 +608,14 @@ func ReloadConfigurationFile(configFile string, storeOptions *StoreOptions) erro
 		storeOptions.PullOptions = config.Storage.Options.PullOptions
 	}
 
-	storeOptions.DisableVolatile = config.Storage.Options.DisableVolatile
-	storeOptions.TransientStore = config.Storage.TransientStore
+	if config.Storage.Options.DisableVolatile {
+		storeOptions.DisableVolatile = config.Storage.Options.DisableVolatile
+	}
+
+	// if _, ok := keySet["storage.transient_store"]; ok {
+	if config.Storage.TransientStore {
+		storeOptions.TransientStore = config.Storage.TransientStore
+	}
 
 	storeOptions.GraphDriverOptions = append(storeOptions.GraphDriverOptions, cfg.GetGraphDriverOptions(storeOptions.GraphDriverName, config.Storage.Options)...)
 
@@ -531,6 +626,97 @@ func ReloadConfigurationFile(configFile string, storeOptions *StoreOptions) erro
 		storeOptions.GraphDriverOptions = nil
 	}
 	return nil
+}
+
+func ConvertTomlToStoreOptions(config *TomlConfig) (storeOptions *StoreOptions, err error) {
+	storeOptions = &StoreOptions{
+		GraphDriverName:     config.Storage.Driver,
+		GraphDriverPriority: config.Storage.DriverPriority,
+		RunRoot:             config.Storage.RunRoot,
+		GraphRoot:           config.Storage.GraphRoot,
+		ImageStore:          config.Storage.ImageStore,
+		RootlessStoragePath: config.Storage.RootlessStoragePath,
+		RootAutoNsUser:      config.Storage.Options.RootAutoUsernsUser,
+		AutoNsMinSize:       config.Storage.Options.AutoUsernsMinSize,
+		AutoNsMaxSize:       config.Storage.Options.AutoUsernsMaxSize,
+		PullOptions:         config.Storage.Options.PullOptions,
+		DisableVolatile:     config.Storage.Options.DisableVolatile,
+		TransientStore:      config.Storage.TransientStore,
+	}
+
+	if config.Storage.Driver != "" {
+		storeOptions.GraphDriverName = config.Storage.Driver
+	}
+	if os.Getenv("STORAGE_DRIVER") != "" {
+		config.Storage.Driver = os.Getenv("STORAGE_DRIVER")
+		storeOptions.GraphDriverName = config.Storage.Driver
+	}
+	if storeOptions.GraphDriverName == overlay2 {
+		logrus.Warnf("Switching default driver from overlay2 to the equivalent overlay driver")
+		storeOptions.GraphDriverName = overlayDriver
+	}
+
+	for _, s := range config.Storage.Options.AdditionalImageStores {
+		storeOptions.GraphDriverOptions = append(storeOptions.GraphDriverOptions, fmt.Sprintf("%s.imagestore=%s", config.Storage.Driver, s))
+	}
+	for _, s := range config.Storage.Options.AdditionalLayerStores {
+		storeOptions.GraphDriverOptions = append(storeOptions.GraphDriverOptions, fmt.Sprintf("%s.additionallayerstore=%s", config.Storage.Driver, s))
+	}
+	if config.Storage.Options.Size != "" {
+		storeOptions.GraphDriverOptions = append(storeOptions.GraphDriverOptions, fmt.Sprintf("%s.size=%s", config.Storage.Driver, config.Storage.Options.Size))
+	}
+	if config.Storage.Options.MountProgram != "" {
+		storeOptions.GraphDriverOptions = append(storeOptions.GraphDriverOptions, fmt.Sprintf("%s.mount_program=%s", config.Storage.Driver, config.Storage.Options.MountProgram))
+	}
+	if config.Storage.Options.SkipMountHome != "" {
+		storeOptions.GraphDriverOptions = append(storeOptions.GraphDriverOptions, fmt.Sprintf("%s.skip_mount_home=%s", config.Storage.Driver, config.Storage.Options.SkipMountHome))
+	}
+	if config.Storage.Options.IgnoreChownErrors != "" {
+		storeOptions.GraphDriverOptions = append(storeOptions.GraphDriverOptions, fmt.Sprintf("%s.ignore_chown_errors=%s", config.Storage.Driver, config.Storage.Options.IgnoreChownErrors))
+	}
+	if config.Storage.Options.ForceMask != 0 {
+		storeOptions.GraphDriverOptions = append(storeOptions.GraphDriverOptions, fmt.Sprintf("%s.force_mask=%o", config.Storage.Driver, config.Storage.Options.ForceMask))
+	}
+	if config.Storage.Options.MountOpt != "" {
+		storeOptions.GraphDriverOptions = append(storeOptions.GraphDriverOptions, fmt.Sprintf("%s.mountopt=%s", config.Storage.Driver, config.Storage.Options.MountOpt))
+	}
+
+	uidmap, err := idtools.ParseIDMap([]string{config.Storage.Options.RemapUIDs}, "remap-uids")
+	if err != nil {
+		return nil, err
+	}
+	gidmap, err := idtools.ParseIDMap([]string{config.Storage.Options.RemapGIDs}, "remap-gids")
+	if err != nil {
+		return nil, err
+	}
+
+	if config.Storage.Options.RemapUser != "" && config.Storage.Options.RemapGroup == "" {
+		config.Storage.Options.RemapGroup = config.Storage.Options.RemapUser
+	}
+	if config.Storage.Options.RemapGroup != "" && config.Storage.Options.RemapUser == "" {
+		config.Storage.Options.RemapUser = config.Storage.Options.RemapGroup
+	}
+	if config.Storage.Options.RemapUser != "" && config.Storage.Options.RemapGroup != "" {
+		mappings, err := idtools.NewIDMappings(config.Storage.Options.RemapUser, config.Storage.Options.RemapGroup)
+		if err != nil {
+			logrus.Warningf("Error initializing ID mappings for %s:%s %v\n", config.Storage.Options.RemapUser, config.Storage.Options.RemapGroup, err)
+			return nil, err
+		}
+		uidmap = mappings.UIDs()
+		gidmap = mappings.GIDs()
+	}
+	storeOptions.UIDMap = uidmap
+	storeOptions.GIDMap = gidmap
+
+	storeOptions.GraphDriverOptions = append(storeOptions.GraphDriverOptions, cfg.GetGraphDriverOptions(storeOptions.GraphDriverName, config.Storage.Options)...)
+
+	if opts, ok := os.LookupEnv("STORAGE_OPTS"); ok {
+		storeOptions.GraphDriverOptions = strings.Split(opts, ",")
+	}
+	if len(storeOptions.GraphDriverOptions) == 1 && storeOptions.GraphDriverOptions[0] == "" {
+		storeOptions.GraphDriverOptions = nil
+	}
+	return storeOptions, nil
 }
 
 func Options() (StoreOptions, error) {

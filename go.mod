@@ -11,6 +11,7 @@ require (
 	github.com/docker/go-units v0.5.0
 	github.com/google/go-intervals v0.0.2
 	github.com/hashicorp/go-multierror v1.1.1
+	github.com/imdario/mergo v0.3.6
 	github.com/json-iterator/go v1.1.12
 	github.com/klauspost/compress v1.17.8
 	github.com/klauspost/pgzip v1.2.6
@@ -29,6 +30,7 @@ require (
 	github.com/vbatts/tar-split v0.11.5
 	golang.org/x/sys v0.19.0
 	gotest.tools v2.2.0+incompatible
+
 )
 
 require (
